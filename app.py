@@ -10,11 +10,15 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from advance_pool import CANCELLED, HELD, WAITING, AdvancePool
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
 TERMINAL = {"duplicate", "approved", "rejected", "closed"}
+# 案件被退回后回到的状态：等待主管重新分配
+RETURNED_STATE = "triaged"
 TRANSITIONS = {
     "received": {"triaged"},
     "triaged": {"assigned", "escalated"},
@@ -68,6 +72,7 @@ def coordinate(value: Any, label: str, low: float, high: float) -> float:
 class CatastropheClaimService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
+        self.pool = AdvancePool()
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -149,6 +154,7 @@ class CatastropheClaimService:
                 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(sha256);
                 """
             )
+            AdvancePool.create_schema(conn)
 
     def _audit(self, conn: sqlite3.Connection, claim_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -339,6 +345,66 @@ class CatastropheClaimService:
             self._audit(conn, claim_id, actor, "claim.review_submitted", {})
             return dict(self._claim(conn, claim_id))
 
+    def _advance_eligible(self, claim: sqlite3.Row, limit: float) -> str | None:
+        """业务判断：该案件当前是否允许占用预付额度。None 表示允许。"""
+        if claim["status"] in {"duplicate", "approved", "rejected", "closed"}:
+            return "当前案件状态不能预付"
+        if not claim["urgent_need"]:
+            return "非紧急案件不能预付"
+        if claim["fraud_score"] >= 0.8:
+            return "高风险案件不能预付"
+        if claim["duplicate_of"]:
+            return "重复报案不能预付"
+        return None
+
+    def _pump_waiting(self, conn: sqlite3.Connection, event_id: str, actor: str) -> list[dict[str, Any]]:
+        """额度释放后按申请先后续放：合格的队头申请占用剩余额度并放款。
+
+        遇到额度仍不足的队头即停止（更晚申请不得插队）；
+        排队期间丧失预付资格的申请直接取消，继续处理后面的申请。
+        """
+        released_now = []
+        while True:
+            row = AdvancePool.head_waiting(conn, event_id)
+            if row is None:
+                break
+            target = self._claim(conn, row["claim_id"])
+            limit = target["estimated_loss"] * 0.2
+            reason = self._advance_eligible(target, limit)
+            now = utcnow()
+            if reason is not None or target["emergency_advance"] + row["amount"] > limit + 1e-9:
+                detail = reason or "累计预付将超过预估损失的20%"
+                AdvancePool.cancel(conn, row["id"], detail, now)
+                self._audit(conn, target["id"], actor, "advance.waiting_cancelled",
+                            {"reservation_id": row["id"], "reason": detail})
+                conn.execute("UPDATE claims SET version=version+1,updated_at=? WHERE id=?", (now, target["id"]))
+                continue
+            if AdvancePool.remaining(conn, event_id) + 1e-9 < row["amount"]:
+                break  # 队头仍放不下，后续申请即使更小也不能越过它
+            conn.execute(
+                "INSERT INTO payments(claim_id,kind,amount,approved_by,reference,created_at) VALUES(?,?,?,?,?,?)",
+                (target["id"], "emergency_advance", row["amount"], actor, row["payment_reference"], now),
+            )
+            AdvancePool.mark_held(conn, row["id"], now)
+            conn.execute(
+                "UPDATE claims SET emergency_advance=emergency_advance+?,version=version+1,updated_at=? WHERE id=?",
+                (row["amount"], now, target["id"]),
+            )
+            self._audit(conn, target["id"], actor, "advance.released_from_queue",
+                        {"amount": row["amount"], "reference": row["payment_reference"], "reservation_id": row["id"]})
+            released_now.append(dict(conn.execute(
+                "SELECT * FROM advance_reservations WHERE id=?", (row["id"],)
+            ).fetchone()))
+        return released_now
+
+    def _release_and_pump(self, conn: sqlite3.Connection, claim: sqlite3.Row,
+                          actor: str, reason: str) -> list[dict[str, Any]]:
+        released = AdvancePool.release_for_claim(conn, claim["id"], reason, utcnow())
+        if released > 0:
+            self._audit(conn, claim["id"], actor, "advance.quota_released",
+                        {"amount": released, "reason": reason, "event_id": claim["event_id"]})
+        return self._pump_waiting(conn, claim["event_id"], actor)
+
     def emergency_advance(self, actor: str, role: str, claim_id: int, amount: float,
                           expected_version: int, reference: str) -> dict[str, Any]:
         actor = actor_id(actor)
@@ -347,32 +413,58 @@ class CatastropheClaimService:
             amount = float(amount)
         except (TypeError, ValueError) as exc:
             raise DomainError("预付金额必须是数值") from exc
+        reference = (reference or "").strip()
+        if not reference:
+            raise DomainError("付款参考号不能为空")
+        if amount <= 0:
+            raise DomainError("预付金额必须大于0", 409)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             claim = self._claim(conn, claim_id)
             if claim["version"] != int(expected_version):
                 raise DomainError("案件已变化，请刷新后重试", 409)
-            if not claim["urgent_need"]:
-                raise DomainError("非紧急案件不能预付", 409)
-            if claim["status"] in {"duplicate", "approved", "rejected", "closed"}:
-                raise DomainError("当前案件状态不能预付", 409)
-            if claim["fraud_score"] >= 0.8:
-                raise DomainError("高风险案件不能预付", 409)
             limit = claim["estimated_loss"] * 0.2
-            if amount <= 0 or amount > limit:
-                raise DomainError("预付金额必须大于0且不超过预估损失的20%", 409)
-            if claim["emergency_advance"] + amount > limit:
+            ineligible = self._advance_eligible(claim, limit)
+            if ineligible is not None:
+                raise DomainError(ineligible, 409)
+            if amount > limit:
+                raise DomainError("预付金额必须不超过预估损失的20%", 409)
+            if claim["emergency_advance"] + amount > limit + 1e-9:
                 raise DomainError("累计预付超过上限", 409)
-            try:
+            if AdvancePool.reference_busy(conn, reference):
+                raise DomainError("付款参考号已存在", 409)
+            if AdvancePool.has_active_waiting(conn, claim_id):
+                raise DomainError("该案件已有待放行申请，不能重复提交", 409)
+            quota = AdvancePool.quota_row(conn, claim["event_id"])
+            if quota is None:
+                raise DomainError("事件尚未录入紧急预付总额度，请先由主管设置", 409)
+            now = utcnow()
+            reservation = self.pool.reserve(conn, claim["event_id"], claim_id, amount, reference, now)
+            result: dict[str, Any]
+            if reservation["status"] == HELD:
                 conn.execute(
                     "INSERT INTO payments(claim_id,kind,amount,approved_by,reference,created_at) VALUES(?,?,?,?,?,?)",
-                    (claim_id, "emergency_advance", amount, actor, reference.strip(), utcnow()),
+                    (claim_id, "emergency_advance", amount, actor, reference, now),
                 )
-            except sqlite3.IntegrityError as exc:
-                raise DomainError("付款参考号已存在", 409) from exc
-            conn.execute("UPDATE claims SET emergency_advance=emergency_advance+?,version=version+1,updated_at=? WHERE id=?", (amount, utcnow(), claim_id))
-            self._audit(conn, claim_id, actor, "payment.emergency_advance", {"amount": amount, "reference": reference})
-            return dict(self._claim(conn, claim_id))
+                conn.execute("UPDATE claims SET emergency_advance=emergency_advance+?,version=version+1,updated_at=? WHERE id=?", (amount, now, claim_id))
+                self._audit(conn, claim_id, actor, "payment.emergency_advance",
+                            {"amount": amount, "reference": reference, "reservation_id": reservation["id"]})
+                result = dict(self._claim(conn, claim_id))
+                result["advance_status"] = HELD
+                result["advance_shortfall"] = 0.0
+            else:
+                # 剩余额度不足：停在待放行，不产生付款、不占用案件预付余额
+                shortfall = amount - AdvancePool.remaining(conn, claim["event_id"])
+                conn.execute("UPDATE claims SET version=version+1,updated_at=? WHERE id=?", (now, claim_id))
+                self._audit(conn, claim_id, actor, "advance.waiting",
+                            {"amount": amount, "reference": reference, "reservation_id": reservation["id"],
+                             "shortfall": round(max(0.0, shortfall), 2)})
+                result = dict(self._claim(conn, claim_id))
+                result["advance_status"] = WAITING
+                result["advance_shortfall"] = round(max(0.0, shortfall), 2)
+            result["reservation_id"] = reservation["id"]
+            result["quota"] = AdvancePool.summary(conn, claim["event_id"])
+            return result
 
     def finalize_claim(self, actor: str, role: str, claim_id: int, decision: str,
                        payout: float, expected_version: int, reason: str = "") -> dict[str, Any]:
@@ -407,7 +499,66 @@ class CatastropheClaimService:
                 (status, payout if decision == "approve" else 0, utcnow(), claim_id, expected_version),
             )
             self._audit(conn, claim_id, actor, "claim.finalized", {"decision": decision, "payout": payout, "reason": reason.strip()})
-            return dict(self._claim(conn, claim_id))
+            # 核定完成（含拒赔）：释放本案件未用占用并续放后续待放行申请
+            released = self._release_and_pump(conn, claim, actor, "核定完成" if decision == "approve" else "案件拒赔")
+            result = dict(self._claim(conn, claim_id))
+            result["released_advances"] = released
+            result["quota"] = AdvancePool.summary(conn, claim["event_id"])
+            return result
+
+    def return_claim(self, actor: str, role: str, claim_id: int, expected_version: int,
+                     reason: str = "") -> dict[str, Any]:
+        """主管退回案件（查勘/核损阶段），案件回到待分配，预付占用一并释放。"""
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "退回案件")
+        if not reason.strip():
+            raise DomainError("退回必须填写理由")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] not in {"assigned", "survey", "review", "escalated"}:
+                raise DomainError("当前状态不能退回", 409)
+            if claim["version"] != int(expected_version):
+                raise DomainError("案件已变化，请刷新后重试", 409)
+            conn.execute(
+                """UPDATE claims SET status=?,assignee=NULL,surveyor=NULL,version=version+1,updated_at=?
+                   WHERE id=?""",
+                (RETURNED_STATE, utcnow(), claim_id),
+            )
+            self._audit(conn, claim_id, actor, "claim.returned", {"reason": reason.strip()})
+            released = self._release_and_pump(conn, claim, actor, "案件退回")
+            result = dict(self._claim(conn, claim_id))
+            result["released_advances"] = released
+            result["quota"] = AdvancePool.summary(conn, claim["event_id"])
+            return result
+
+    def set_advance_quota(self, actor: str, role: str, event_id: str, total_amount: float,
+                          expected_version: int | None = None) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "录入紧急预付总额度")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                quota = self.pool.set_quota(conn, event_id, total_amount, actor, utcnow(), expected_version)
+            except ValueError as exc:
+                raise DomainError(str(exc)) from exc
+            except LookupError as exc:
+                raise DomainError(str(exc), 409) from exc
+            self._audit(conn, None, actor, "advance.quota_set",
+                        {"event_id": quota["event_id"], "total_amount": quota["total_amount"],
+                         "version": quota["version"]})
+            return AdvancePool.summary(conn, quota["event_id"])
+
+    def advance_quota_view(self, role: str, event_id: str | None = None) -> Any:
+        if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
+            raise DomainError("角色无权查看预付额度", 403)
+        with self.connect() as conn:
+            if event_id:
+                summary = AdvancePool.summary(conn, event_id.strip())
+                if summary is None:
+                    raise DomainError("该事件尚未录入紧急预付总额度", 404)
+                return summary
+            return {"events": AdvancePool.list_events(conn)}
 
     def queue(self, role: str = "viewer", actor: str = "") -> list[dict[str, Any]]:
         if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
@@ -449,6 +600,7 @@ class CatastropheClaimService:
                 return {"seeded": False, "reason": "已有数据"}
         c1 = self.create_claim("intake-demo", "intake", "CLM-DEMO-001", "TY2026", "沿海A区", "洪水", "P-1001", "R-01", 30.1, 121.2, 500000, True, True)
         self.create_claim("intake-demo", "intake", "CLM-DEMO-002", "TY2026", "沿海A区", "洪水", "P-1002", "R-02", 30.2, 121.3, 240000, False, False)
+        self.set_advance_quota("sup-demo", "supervisor", "TY2026", 200000)
         return {"seeded": True, "first_claim_id": c1["id"]}
 
 
@@ -482,7 +634,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path, query = parsed.path, parse_qs(parsed.query)
             if path in {"/", "/index.html"}:
                 body = (ROOT / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -498,6 +651,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif path == "/api/advance-quota":
+                actor, role = self._headers()
+                self._send(200, self.service.advance_quota_view(role, query.get("event_id", [""])[0]))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
@@ -522,6 +678,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.emergency_advance(actor, role, **data)
             elif path == "/api/claims/finalize":
                 result = self.service.finalize_claim(actor, role, **data)
+            elif path == "/api/claims/return":
+                result = self.service.return_claim(actor, role, **data)
+            elif path == "/api/advance-quota":
+                result = self.service.set_advance_quota(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)

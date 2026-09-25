@@ -1,6 +1,115 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
-<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}
+table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px;text-align:left}
+th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px;margin:12px 0}
+code{background:#eef2f4;padding:2px 5px}
+h2{margin-top:30px;border-bottom:2px solid #d3dce3;padding-bottom:6px}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.wait{background:#fdeeee}.held{background:#eef7ee}
+input,select,button{font:inherit;padding:5px 8px;margin:2px}
+button{cursor:pointer;border:1px solid #9fb0bd;background:#f1f5f7;border-radius:4px}
+button.primary{background:#2f6f9f;color:#fff;border-color:#2f6f9f}
+.bar{height:14px;background:#e6edf1;border-radius:7px;overflow:hidden;width:220px;display:inline-block;vertical-align:middle}
+.bar>span{display:block;height:100%;background:#d58b21}
+.muted{color:#6b7c8a;font-size:13px}
+#msg{margin:10px 0;padding:8px 12px;border-radius:4px;display:none}
+#msg.ok{background:#e8f5e8;display:block}#msg.err{background:#fde8e8;display:block}
+</style>
+<h1>巨灾保险理赔调度</h1>
+<div class="card">
+  台风等灾害事件的紧急预付共享<b>一笔总额度</b>：主管先按事件录入额度，批准时按申请先后占用；
+  剩余额度不足的申请停在<b>待放行</b>并显示缺口；案件拒赔、退回或核定完成后释放占用，自动按队列续放。
+  写入接口需要身份：
+  <input id="user" value="sup1" size="9">
+  <select id="role"><option>supervisor</option><option>intake</option><option>adjuster</option><option>surveyor</option><option>auditor</option></select>
+  <button onclick="loadAll()">刷新</button>
+</div>
+<div id="msg"></div>
+
+<h2>按事件查看预付额度</h2>
+<table id="quotas"><thead><tr>
+  <th>灾害事件</th><th class="num">总额度</th><th class="num">已占用</th><th class="num">剩余</th>
+  <th>占用比例</th><th class="num">待放行笔数/金额</th><th class="num">清空队列缺口</th><th>主管操作</th>
+</tr></thead><tbody></tbody></table>
+
+<h3>已占用明细</h3>
+<table id="held"><thead><tr><th>事件</th><th>报案号</th><th class="num">金额</th><th>付款参考号</th><th>放行时间</th></tr></thead><tbody></tbody></table>
+
+<h3>待放行清单（FIFO，含本笔缺口）</h3>
+<table id="waiting"><thead><tr><th>#</th><th>事件</th><th>报案号</th><th class="num">申请金额</th><th class="num">当前缺口</th><th>申请时间</th><th>付款参考号</th></tr></thead><tbody></tbody></table>
+
+<h2>优先队列</h2>
+<table id="claims"><thead><tr><th>报案号</th><th>事件</th><th>区域</th><th>状态</th><th>紧急</th><th class="num">预估损失</th><th class="num">已预付</th><th>优先级</th><th>欺诈分</th><th>负责人</th><th>操作</th></tr></thead><tbody></tbody></table>
+
 <h2>最近时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+
+<script>
+function hdr(){return{'X-User':document.getElementById('user').value,'X-Role':document.getElementById('role').value,'Content-Type':'application/json'}}
+function money(n){return Number(n).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function msg(t,ok){const m=document.getElementById('m'+'sg');m.textContent=t;m.className=ok?'ok':'err';setTimeout(()=>m.className='',4000)}
+async function api(url,opt={}){
+  const r=await fetch(url,{...opt,headers:hdr()});const d=await r.json();
+  if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d;
+}
+async function post(url,body){
+  const d=await api(url,{method:'POST',body:JSON.stringify(body)});
+  await loadAll();return d;
+}
+async function loadAll(){
+  const [q,s]=await Promise.all([api('/api/advance-quota').catch(e=>({events:[]})),api('/api/state').catch(e=>({claims:[],timeline:[]}))]);
+  renderQuotas(q.events||[]);renderClaims(s.claims||[]);
+  document.getElementById('timeline').innerHTML=(s.timeline||[]).slice(0,25)
+    .map(x=>`<li class="muted">${x.created_at} ${esc(x.actor)} ${esc(x.action)} ${esc(x.details)}</li>`).join('');
+}
+function renderQuotas(events){
+  document.querySelector('#quotas tbody').innerHTML=events.map(e=>{
+    const pct=e.total_amount?Math.min(100,e.held_total/e.total_amount*100):0;
+    return `<tr><td><b>${esc(e.event_id)}</b></td><td class="num">${money(e.total_amount)}</td>
+    <td class="num held">${money(e.held_total)}</td><td class="num">${money(e.remaining)}</td>
+    <td><span class="bar"><span style="width:${pct}%"></span></span> ${pct.toFixed(0)}%</td>
+    <td class="num wait">${e.waiting.length} 笔 / ${money(e.waiting_total)}</td>
+    <td class="num wait">${money(e.queue_shortfall)}</td>
+    <td><button onclick="setQuota('${esc(e.event_id)}',${e.total_amount},${e.version})">调整额度</button></td></tr>`;
+  }).join('')||`<tr><td colspan="8" class="muted">尚未录入任何事件额度（主管可新建）：</td></tr>`;
+  const newRow=`<tr><td><input id="newEvent" placeholder="事件号 如 TY2026" size="12"></td>
+    <td colspan="6"><input id="newAmount" placeholder="总额度" type="number" size="12"></td>
+    <td><button class="primary" onclick="setQuota(document.getElementById('newEvent').value,Number(document.getElementById('newAmount').value))">录入额度</button></td></tr>`;
+  document.querySelector('#quotas tbody').insertAdjacentHTML('beforeend',newRow);
+
+  const held=events.flatMap(e=>e.held.map(r=>({...r,event_id:e.event_id})));
+  document.querySelector('#held tbody').innerHTML=held.map(r=>
+    `<tr class="held"><td>${esc(r.event_id)}</td><td>${esc(r.claim_no)}</td><td class="num">${money(r.amount)}</td>
+     <td><code>${esc(r.payment_reference)}</code></td><td class="muted">${esc(r.decided_at)}</td></tr>`).join('')
+     ||`<tr><td colspan="5" class="muted">暂无</td></tr>`;
+
+  const waiting=events.flatMap(e=>e.waiting.map((r,i)=>({...r,pos:i+1})));
+  document.querySelector('#waiting tbody').innerHTML=waiting.map(r=>
+    `<tr class="wait"><td>${r.pos}</td><td>${esc(r.event_id)}</td><td><b>${esc(r.claim_no)}</b></td>
+     <td class="num">${money(r.amount)}</td><td class="num"><b>${money(r.shortfall)}</b></td>
+     <td class="muted">${esc(r.queued_at)}</td><td><code>${esc(r.payment_reference)}</code></td></tr>`).join('')
+     ||`<tr><td colspan="7" class="muted">无待放行申请</td></tr>`;
+}
+function renderClaims(claims){
+  document.querySelector('#claims tbody').innerHTML=claims.map(r=>
+    `<tr><td>${esc(r.claim_no)}</td><td>${esc(r.event_id)}</td><td>${esc(r.region)}</td>
+     <td>${esc(r.status)}</td><td>${r.urgent_need?'是':''}</td>
+     <td class="num">${money(r.estimated_loss)}</td><td class="num">${money(r.emergency_advance)}</td>
+     <td>${(r.priority_score||0).toFixed(1)}</td><td>${r.fraud_score}</td>
+     <td>${esc(r.assignee||'')}</td>
+     <td>${['assigned','survey','review','escalated'].includes(r.status)?`<button onclick="retClaim(${r.id},${r.version})">退回</button>`:''}</td></tr>`).join('');
+}
+async function setQuota(event_id,total_amount,expected_version){
+  const v=prompt('设置事件 '+event_id+' 的紧急预付总额度（不能低于当前已占用）',total_amount||'');
+  if(v===null)return;
+  const body={event_id,total_amount:Number(v)};if(expected_version)body.expected_version=expected_version;
+  try{await post('/api/advance-quota',body);msg('额度已保存',true)}catch(e){msg(e.message,false)}
+}
+async function retClaim(id,ver){
+  const reason=prompt('退回理由');if(!reason)return;
+  try{await post('/api/claims/return',{claim_id:id,expected_version:ver,reason});msg('案件已退回，占用已释放并尝试续放',true)}
+  catch(e){msg(e.message,false)}
+}
+loadAll();setInterval(loadAll,5000);
+</script></html>
