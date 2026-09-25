@@ -22,6 +22,7 @@ class CatastropheClaimFlowTest(unittest.TestCase):
         )
 
     def test_complete_claim_lifecycle_with_emergency_advance(self):
+        self.service.set_event_pool("sup1", "supervisor", "TY-2026", 1000000)
         claim = self.claim("C-001", urgent=True)
         claim = self.service.triage_claim("sup1", "supervisor", claim["id"], claim["version"], 0.1, True)
         claim = self.service.assign_claim("sup1", "supervisor", claim["id"], "adjuster1", claim["version"], "survey1")

@@ -1,6 +1,104 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
-<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}
+table{border-collapse:collapse;width:100%;margin:14px 0}
+th,td{border:1px solid #d3dce3;padding:7px;text-align:left}
+th{background:#f1f5f7}
+.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}
+code{background:#eef2f4;padding:2px 5px}
+.cards{display:flex;gap:14px;flex-wrap:wrap;margin:14px 0}
+.metric{flex:1;min-width:150px;background:#f6f9fb;border:1px solid #dbe5ec;border-radius:8px;padding:12px 16px}
+.metric b{display:block;font-size:22px;margin-top:4px}
+.bar{height:14px;background:#e8eef2;border-radius:7px;overflow:hidden;margin:6px 0 14px}
+.bar>i{display:block;height:100%;background:#d58b21}
+.gap{color:#b23b3b;font-weight:600}
+.muted{color:#7a8a97}
+button{padding:6px 14px;cursor:pointer}
+input,select{padding:5px 8px}
+form{margin:10px 0}
+</style>
+<h1>巨灾保险理赔调度</h1>
+<div class="card">台风理赔高峰时，同一灾害事件的紧急预付共享一笔总额度：主管先录入额度，批准按案件先后占用；超出剩余额度的申请停在待放行并显示缺口；案件拒赔、退回或核定完成后，未用占用自动释放给后续案件。页面重开会恢复上次查看的事件。</div>
+
+<h2>事件预付额度</h2>
+<div>事件 <select id="event-select"></select> <button id="refresh" type="button">刷新</button> <span class="muted" id="pool-msg"></span></div>
+<div class="cards">
+<div class="metric">总额度<b id="m-total">-</b></div>
+<div class="metric">已占用<b id="m-occupied">-</b></div>
+<div class="metric">剩余可用<b id="m-available">-</b></div>
+<div class="metric">待放行<b id="m-pending">-</b></div>
+</div>
+<div class="bar"><i id="occ-bar"></i></div>
+<h3>待放行清单</h3>
+<table id="pending"><thead><tr><th>请求号</th><th>报案号</th><th>申请金额</th><th>缺口</th><th>申请人</th><th>申请时间</th></tr></thead><tbody></tbody></table>
+<h3>已占用（已放行预付）</h3>
+<table id="holds"><thead><tr><th>请求号</th><th>报案号</th><th>金额</th><th>付款参考号</th><th>放行时间</th></tr></thead><tbody></tbody></table>
+<h3>已释放 / 已取消</h3>
+<table id="history"><thead><tr><th>请求号</th><th>报案号</th><th>金额</th><th>状态</th><th>原因</th><th>时间</th></tr></thead><tbody></tbody></table>
+
+<h3>录入 / 调整事件额度（主管）</h3>
+<form id="pool-form">
+事件ID <input id="f-event" required>
+总额度 <input id="f-quota" type="number" min="0.01" step="0.01" required>
+操作人 <input id="f-user" value="sup-page" required>
+<button>保存并放行等待队列</button>
+</form>
+
+<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>事件</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>已预付</th><th>负责人</th></tr></thead><tbody></tbody></table>
 <h2>最近时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+const H={'X-User':'page-auditor','X-Role':'auditor'};
+const fmt=n=>Number(n).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
+const $=s=>document.querySelector(s);
+let currentEvent=localStorage.getItem('quotaEvent')||'';
+function renderEmpty(){
+  ['#m-total','#m-occupied','#m-available','#m-pending'].forEach(s=>$(s).textContent='-');
+  $('#occ-bar').style.width='0';
+  $('#pending tbody').innerHTML='<tr><td colspan="6" class="muted">暂无待放行申请</td></tr>';
+  $('#holds tbody').innerHTML='<tr><td colspan="5" class="muted">暂无占用</td></tr>';
+  $('#history tbody').innerHTML='<tr><td colspan="6" class="muted">暂无记录</td></tr>';
+}
+async function loadPools(){
+  const r=await fetch('/api/advance-pools',{headers:H});
+  const d=await r.json();
+  const pools=d.pools||[];
+  const sel=$('#event-select');
+  sel.innerHTML=pools.length?pools.map(p=>`<option value="${p.event_id}">${p.event_id}（剩余 ${fmt(p.available)}）</option>`).join(''):'<option value="">（暂无额度池）</option>';
+  if(currentEvent&&pools.some(p=>p.event_id===currentEvent)){sel.value=currentEvent;}
+  currentEvent=sel.value;
+  if(currentEvent){loadPool(currentEvent);}else{renderEmpty();}
+}
+async function loadPool(ev){
+  if(!ev){renderEmpty();return;}
+  currentEvent=ev;localStorage.setItem('quotaEvent',ev);
+  $('#f-event').value=ev;
+  const r=await fetch('/api/advance-pool?event_id='+encodeURIComponent(ev),{headers:H});
+  const d=await r.json();
+  if(!r.ok){$('#pool-msg').textContent=d.error||'加载失败';renderEmpty();return;}
+  $('#pool-msg').textContent='';
+  $('#m-total').textContent=fmt(d.pool.total_quota);
+  $('#m-occupied').textContent=fmt(d.occupied);
+  $('#m-available').textContent=fmt(d.available);
+  $('#m-pending').textContent=d.pending.length+' 笔';
+  $('#occ-bar').style.width=(d.pool.total_quota>0?Math.min(100,d.occupied/d.pool.total_quota*100):0)+'%';
+  $('#pending tbody').innerHTML=d.pending.map(x=>`<tr><td>${x.id}</td><td>${x.claim_no}</td><td>${fmt(x.amount)}</td><td class="gap">${fmt(x.gap)}</td><td>${x.requested_by}</td><td>${x.created_at}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">暂无待放行申请</td></tr>';
+  $('#holds tbody').innerHTML=d.holds.map(x=>`<tr><td>${x.id}</td><td>${x.claim_no}</td><td>${fmt(x.amount)}</td><td>${x.reference}</td><td>${x.approved_at||''}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">暂无占用</td></tr>';
+  $('#history tbody').innerHTML=d.history.map(x=>`<tr><td>${x.id}</td><td>${x.claim_no}</td><td>${fmt(x.amount)}</td><td>${x.status==='released'?'已释放':'已取消'}</td><td>${x.close_reason||''}</td><td>${x.closed_at||''}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">暂无记录</td></tr>';
+}
+$('#event-select').addEventListener('change',e=>loadPool(e.target.value));
+$('#refresh').addEventListener('click',()=>{loadPools();load();});
+$('#pool-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const body={event_id:$('#f-event').value.trim(),total_quota:parseFloat($('#f-quota').value)};
+  const r=await fetch('/api/events/pool',{method:'POST',headers:{'Content-Type':'application/json','X-User':$('#f-user').value.trim()||'sup-page','X-Role':'supervisor'},body:JSON.stringify(body)});
+  const d=await r.json();
+  if(r.ok){$('#pool-msg').textContent=`额度已保存，自动放行 ${d.promoted.length} 笔待放行申请`;await loadPools();}
+  else{$('#pool-msg').textContent=d.error||'保存失败';}
+});
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.event_id}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${fmt(r.emergency_advance)}</td><td>${r.assignee||''}</td></tr>`).join('');
+  document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('');
+}
+loadPools();load();
+</script></html>
